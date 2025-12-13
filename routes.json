@@ -1,0 +1,9 @@
+{
+  "/": "hello",
+  "/hello": "hello",
+  "/request_demo": "request_demo",
+  "/kv": "kv",
+  "/todo/:id": "todo",
+  "/api/*": "api_router",
+  "/greet": "hello"
+}
