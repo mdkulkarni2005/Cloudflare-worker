@@ -1,0 +1,12 @@
+import fs from "fs";
+import path from "path";
+
+export async function GET(req: Request) {
+  const url = new URL(req.url);
+  const name = url.searchParams.get("name");
+
+  const filePath = path.resolve(`../mini-bun-edge/workers/${name}.js`);
+  const code = fs.readFileSync(filePath, "utf8");
+
+  return new Response(code);
+}
