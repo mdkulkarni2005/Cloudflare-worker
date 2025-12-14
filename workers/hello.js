@@ -1,4 +1,2 @@
-globalThis.handle = async function (req) {
-  const body = await req.text();
-  return "Hello " + body;
-};
+globalThis.handle = () => "hi"
+console.log("Manas")

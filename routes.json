@@ -5,5 +5,7 @@
   "/kv": "kv",
   "/todo/:id": "todo",
   "/api/*": "api_router",
-  "/greet": "hello"
+  "/greet": "hello",
+  "/hi": "hello",
+  "/test": "hello"
 }

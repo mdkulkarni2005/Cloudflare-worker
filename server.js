@@ -1,173 +1,237 @@
-// server.js (routing-enabled)
-// Bun runtime mini-edge with routes + deploy support
-import { createContext, Script } from "node:vm";
+import { readFileSync, writeFileSync, existsSync, readdirSync } from "fs";
 import fs from "fs";
 import path from "path";
+import vm from "vm";
+import { fileURLToPath } from "url";
 
-const WORKERS_DIR = path.resolve("./workers");
-const ROUTES_PATH = path.resolve("./routes.json");
-const KV_DB_PATH = "./kv.db.json";
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-// ---- KV helpers ----
-async function loadKV() {
-  try {
-    const file = await Bun.file(KV_DB_PATH).json();
-    return file || {};
-  } catch { return {}; }
-}
-async function saveKV(data) { await Bun.write(KV_DB_PATH, JSON.stringify(data, null, 2)); }
-async function kvGet(key) { const db = await loadKV(); return db[key] ?? null; }
-async function kvPut(key, value) { const db = await loadKV(); db[key] = value; await saveKV(db); }
-async function kvDelete(key) { const db = await loadKV(); delete db[key]; await saveKV(db); }
+const WORKERS_DIR = path.join(__dirname, "workers");
+const ROUTES_JSON = path.join(__dirname, "routes.json");
+const KV_JSON = path.join(__dirname, "kv.json");
 
-// ---- Safe fetch shim ----
-const OUTBOUND_ALLOWLIST = ["api.github.com","jsonplaceholder.typicode.com","httpbin.org"];
-function makeSafeFetch() {
-  return async function safeFetch(input, init={}) {
-    try {
-      const url = new URL(input);
-      if (!OUTBOUND_ALLOWLIST.includes(url.hostname)) throw new Error(`Outbound domain not allowed: ${url.hostname}`);
-      console.log("[host] outgoing fetch to", url.toString());
-      const resp = await fetch(url.toString(), init);
-      const text = await resp.text();
-      return { status: resp.status, headers: Object.fromEntries(resp.headers), text };
-    } catch (e) { return { error: e?.message || String(e) }; }
-  };
+if (!existsSync(KV_JSON)) writeFileSync(KV_JSON, "{}");
+
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "*",
+  "Access-Control-Allow-Methods": "*"
+};
+
+let LOGS = [];
+
+function pushLog(type, message) {
+  LOGS.push({ type, message, time: Date.now() });
+  if (LOGS.length > 300) LOGS.shift();
 }
 
-// ---- Response class for workers ----
-class WorkerResponse {
-  constructor(body, options={}) { this.body = body; this.status = options.status || 200; this.headers = options.headers || {}; }
+function getLogs() {
+  return LOGS.slice(-200);
 }
 
-// ---- Routes loader & matcher ----
 function loadRoutes() {
-  try {
-    const raw = fs.readFileSync(ROUTES_PATH, "utf8");
-    const obj = JSON.parse(raw);
-    // convert to array of { pattern, target, regex, keys }
-    return Object.entries(obj).map(([pattern, target]) => {
-      // escape regex special chars, then replace :param and * with capture groups
-      let regexStr = pattern.replace(/[-\/\\^$+?.()|[\]{}]/g, "\\$&");
-      // replace :param -> ([^/]+)
-      regexStr = regexStr.replace(/\\:([a-zA-Z0-9_]+)/g, "([^/]+)");
-      // replace wildcard \* -> (.*)
-      regexStr = regexStr.replace(/\\\*/g, "(.*)");
-      const regex = new RegExp("^" + regexStr + "$");
-      return { pattern, target, regex };
-    });
-  } catch (e) {
-    return []; // no routes.json
+  return existsSync(ROUTES_JSON)
+    ? JSON.parse(readFileSync(ROUTES_JSON, "utf8"))
+    : {};
+}
+
+function kvGet(key) {
+  return JSON.parse(readFileSync(KV_JSON, "utf8"))[key] ?? null;
+}
+
+function kvPut(key, value) {
+  const data = JSON.parse(readFileSync(KV_JSON, "utf8"));
+  data[key] = value;
+  writeFileSync(KV_JSON, JSON.stringify(data, null, 2));
+}
+
+function kvDelete(key) {
+  const data = JSON.parse(readFileSync(KV_JSON, "utf8"));
+  delete data[key];
+  writeFileSync(KV_JSON, JSON.stringify(data, null, 2));
+}
+
+function createSandbox() {
+  const ctx = {
+    console: {
+      log: (...args) => {
+        const msg = "[worker] " + args.join(" ");
+        console.log(msg);
+        pushLog("log", msg);
+      },
+      error: (...args) => {
+        const msg = "[worker-error] " + args.join(" ");
+        console.error(msg);
+        pushLog("error", msg);
+      }
+    },
+    fetch,
+    globalThis: {}
+  };
+
+  return vm.createContext(ctx);
+}
+
+function loadWorker(name) {
+  const file = path.join(WORKERS_DIR, `${name}.js`);
+  if (!existsSync(file)) throw new Error("Worker not found");
+  return readFileSync(file, "utf8");
+}
+
+async function runWorker(name, req, body) {
+  const code = loadWorker(name);
+  const ctx = createSandbox();
+
+  ctx.KV = { get: kvGet, put: kvPut, delete: kvDelete };
+
+  vm.runInContext(code, ctx);
+
+  const handler = ctx.handle || ctx.globalThis.handle;
+  if (typeof handler !== "function") {
+    throw new Error("Worker missing globalThis.handle");
   }
+
+  return await handler(req, body);
 }
 
 function matchRoute(pathname, routes) {
-  // prefer exact match first
-  for (const r of routes) {
-    if (r.pattern === pathname) return { target: r.target, params: {} };
-  }
-  // then regex match in order
-  for (const r of routes) {
-    const m = pathname.match(r.regex);
-    if (m) {
-      // capture groups -> params as param1, param2... (we didn't track names)
-      const captures = m.slice(1);
-      return { target: r.target, params: captures };
+  for (const [pattern, worker] of Object.entries(routes)) {
+    const params = {};
+
+    if (pattern.includes("*")) {
+      const base = pattern.replace("*", "");
+      if (pathname.startsWith(base)) {
+        params.wildcard = pathname.slice(base.length);
+        return { worker, params };
+      }
     }
+
+    const p = pattern.split("/").filter(Boolean);
+    const u = pathname.split("/").filter(Boolean);
+
+    if (p.length !== u.length) continue;
+
+    let ok = true;
+
+    for (let i = 0; i < p.length; i++) {
+      if (p[i].startsWith(":")) {
+        params[p[i].slice(1)] = u[i];
+      } else if (p[i] !== u[i]) {
+        ok = false;
+        break;
+      }
+    }
+
+    if (ok) return { worker, params };
   }
+
   return null;
 }
 
-// ---- Sandbox context ----
-function createSandboxContext() {
-  return createContext({
-    console: {
-      log: (...args) => console.log("[worker]", ...args),
-      error: (...args) => console.error("[worker]", ...args)
-    },
-    fetch: undefined,
-    KV: { get: kvGet, put: kvPut, delete: kvDelete },
-    Response: WorkerResponse,
-    globalThis: {}
-  });
-}
-
-// ---- worker loader ----
-async function loadWorkerSource(name) {
-  const p = path.join(WORKERS_DIR, `${name}.js`);
-  if (!fs.existsSync(p)) throw new Error("Worker not found: " + name);
-  return await Bun.file(p).text();
-}
-function initWorkerInContext(code, workerName) {
-  const wrapped = `(function(){ try { ${code} } catch(e) { globalThis.__init_error = e?.message || String(e);} return globalThis; })();`;
-  const ctx = createSandboxContext();
-  const safeFetch = makeSafeFetch();
-  ctx.fetch = safeFetch; ctx.globalThis.fetch = safeFetch;
-  const script = new Script(wrapped, { filename: workerName + ".js" });
-  const globalAfter = script.runInContext(ctx, { timeout: 300 });
-  if (globalAfter.__init_error) throw new Error("Worker init error: " + globalAfter.__init_error);
-  return { ctx, handle: globalAfter.handle };
-}
-
-// ---- call with timeout ----
-async function callHandlerWithTimeout(fn, ctx, requestObject, rawBody, timeoutMs = 2000) {
-  let workerCall;
-  try {
-    if (fn.length === 1) workerCall = fn.call(ctx, requestObject);
-    else workerCall = fn.call(ctx, rawBody);
-  } catch (e) { return { error: e.message }; }
-  const handlerPromise = Promise.resolve(workerCall);
-  const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("handler timeout")), timeoutMs));
-  try { return { value: await Promise.race([handlerPromise, timeoutPromise]) }; }
-  catch (e) { return { error: e.message }; }
-}
-
-// ---- run worker by worker name ----
-async function runWorkerByName(workerName, req, body) {
-  const code = await loadWorkerSource(workerName);
-  const requestObject = { method: req.method, url: req.url, headers: Object.fromEntries(req.headers), text: async()=>body, json: async()=>JSON.parse(body||"{}") };
-  const { ctx, handle } = initWorkerInContext(code, workerName);
-  if (typeof handle !== "function") throw new Error("Worker missing globalThis.handle");
-  return await callHandlerWithTimeout(handle, ctx, requestObject, body);
-}
-
-// ---- HTTP server with routing ----
 Bun.serve({
   port: 3000,
+
   async fetch(req) {
-    try {
-      const url = new URL(req.url);
-      const pathname = url.pathname;
+    const url = new URL(req.url);
+
+    if (req.method === "OPTIONS") {
+      return new Response(null, { headers: CORS_HEADERS });
+    }
+
+    if (url.pathname === "/__logs") {
+      return new Response(JSON.stringify(getLogs()), {
+        headers: { "content-type": "application/json", ...CORS_HEADERS }
+      });
+    }
+
+    if (url.pathname === "/api/workers/list") {
+      const files = readdirSync(WORKERS_DIR)
+        .filter(f => f.endsWith(".js"))
+        .map(f => f.replace(".js", ""));
+      return new Response(JSON.stringify(files), {
+        headers: { "content-type": "application/json", ...CORS_HEADERS }
+      });
+    }
+
+    if (url.pathname === "/api/workers/get") {
+      const name = url.searchParams.get("name");
+      if (!name) return new Response("Missing name", { status: 400 });
+      return new Response(loadWorker(name), {
+        headers: { "content-type": "text/plain", ...CORS_HEADERS }
+      });
+    }
+
+    if (url.pathname === "/api/workers/deploy") {
+      const { name, code } = await req.json();
+      writeFileSync(path.join(WORKERS_DIR, `${name}.js`), code);
+      return new Response("OK", { headers: CORS_HEADERS });
+    }
+
+    if (url.pathname === "/api/routes/list") {
+      return new Response(JSON.stringify(loadRoutes()), {
+        headers: { "content-type": "application/json", ...CORS_HEADERS }
+      });
+    }
+
+    if (url.pathname === "/api/routes/add") {
+      const { path: route, worker } = await req.json();
+      const routes = loadRoutes();
+      routes[route] = worker;
+      writeFileSync(ROUTES_JSON, JSON.stringify(routes, null, 2));
+      return new Response("OK", { headers: CORS_HEADERS });
+    }
+
+    if (url.pathname === "/api/routes/delete") {
+      const { path: route } = await req.json();
+      const routes = loadRoutes();
+      delete routes[route];
+      writeFileSync(ROUTES_JSON, JSON.stringify(routes, null, 2));
+      return new Response("OK", { headers: CORS_HEADERS });
+    }
+
+    if (url.pathname === "/__run") {
+      const { route, method, body } = await req.json();
+      const match = matchRoute(route, loadRoutes());
+      if (!match) return new Response("Route not found", { status: 404 });
+
+      const output = await runWorker(
+        match.worker,
+        { method, path: route, params: match.params },
+        body
+      );
+
+      return new Response(output, { headers: CORS_HEADERS });
+    }
+
+    const match = matchRoute(url.pathname, loadRoutes());
+
+    if (match) {
       const body = await req.text();
 
-      const routes = loadRoutes();
-      const matched = matchRoute(pathname, routes);
+      const reqObj = {
+        method: req.method,
+        path: url.pathname,
+        params: match.params,
+        query: Object.fromEntries(url.searchParams),
+        headers: Object.fromEntries(req.headers),
+        body
+      };
 
-      let workerName = null;
-      if (matched) workerName = matched.target;
-      else {
-        // fallback - try filename from path (strip leading slash and remove extensions)
-        const candidate = pathname.replace(/^\//, "") || "hello";
-        workerName = candidate || "hello";
+      try {
+        const output = await runWorker(match.worker, reqObj, body);
+        return new Response(output, {
+          headers: { "content-type": "text/plain", ...CORS_HEADERS }
+        });
+      } catch (e) {
+        pushLog("error", e.message);
+        return new Response("Runtime Error: " + e.message, { status: 500 });
       }
-
-      // run the worker
-      const { value, error } = await runWorkerByName(workerName, req, body);
-      if (error) {
-        if (error === "handler timeout") return new Response("Worker timeout", { status: 504 });
-        return new Response("Runtime error: " + error, { status: 500 });
-      }
-      const result = value;
-      if (result instanceof WorkerResponse) {
-        return new Response(result.body, { status: result.status, headers: result.headers });
-      }
-      if (typeof result === "string") return new Response(result);
-      return new Response(JSON.stringify(result), { headers: { "content-type": "application/json" }});
-    } catch (err) {
-      console.error("Server error:", err);
-      return new Response("Server error: " + (err?.message || String(err)), { status: 500 });
     }
+
+    pushLog("error", "404 " + url.pathname);
+    return new Response("404 Not Found", { status: 404 });
   }
 });
 
-console.log("Mini Cloudflare Worker runtime (routing) listening: http://localhost:3000");
+console.log("🔥 Mini Edge Runtime running at http://localhost:3000");
