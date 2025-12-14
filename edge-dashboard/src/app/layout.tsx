@@ -20,6 +20,8 @@ export default function RootLayout({ children }: { children: ReactNode }) {
             <NavItem name="Routes" href="/routes" />
             <NavItem name="KV Storage" href="/kv" />
             <NavItem name="Logs" href="/logs" />
+            <NavItem name="Playground" href="/playground" />
+            <NavItem name="Metrics" href="/metrics" />
           </nav>
 
           <footer className="mt-auto text-sm text-gray-500">

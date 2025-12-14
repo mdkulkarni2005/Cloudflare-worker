@@ -2,25 +2,26 @@
 
 import { useEffect, useState } from "react";
 
-export default function Playground() {
-  const [routes, setRoutes] = useState<string[]>([]);
+export default function PlaygroundPage() {
+  const [routes, setRoutes] = useState<Record<string, string>>({});
   const [route, setRoute] = useState("");
-  const [method, setMethod] = useState("POST");
+  const [method, setMethod] = useState("GET");
   const [body, setBody] = useState("");
   const [output, setOutput] = useState("");
-  const [logs, setLogs] = useState([]);
+  const [logs, setLogs] = useState<string[]>([]);
+  const [running, setRunning] = useState(false);
 
   useEffect(() => {
-    async function load() {
-      const res = await fetch("/api/routes/list");
-      const json = await res.json();
-      setRoutes(Object.keys(json));
-    }
-    load();
+    fetch("/api/routes/list")
+      .then((r) => r.json())
+      .then(setRoutes);
   }, []);
 
-  async function runWorker() {
+  async function run() {
     if (!route) return alert("Select a route");
+
+    setRunning(true);
+    setOutput("");
 
     const res = await fetch("http://localhost:3000/__run", {
       method: "POST",
@@ -28,31 +29,38 @@ export default function Playground() {
       body: JSON.stringify({
         route,
         method,
-        body,
-      }),
+        body
+      })
     });
 
-    const txt = await res.text();
-    setOutput(txt);
-
-    const logRes = await fetch("http://localhost:3000/__logs");
-    setLogs(await logRes.json());
+    const text = await res.text();
+    setOutput(text);
+    setRunning(false);
   }
 
-  return (
-    <div className="p-6">
-      <h1 className="text-3xl font-bold mb-6">Worker Playground</h1>
+  useEffect(() => {
+    const id = setInterval(async () => {
+      const res = await fetch("http://localhost:3000/__logs");
+      const data = await res.json();
+      setLogs(data.map((l: any) => `[${l.type}] ${l.message}`));
+    }, 1500);
 
-      <div className="bg-[#181818] p-6 rounded-xl border border-gray-800">
-        {/* Route selector */}
+    return () => clearInterval(id);
+  }, []);
+
+  return (
+    <div>
+      <h1 className="text-3xl font-bold mb-8">Playground</h1>
+
+      <div className="bg-[#181818] border border-gray-800 rounded-xl p-6 mb-8">
         <div className="flex gap-4 mb-4">
           <select
             value={route}
             onChange={(e) => setRoute(e.target.value)}
-            className="bg-black border border-gray-700 px-3 py-2 rounded-md"
+            className="bg-[#101010] border border-gray-700 rounded px-3 py-2"
           >
-            <option value="">Select Route</option>
-            {routes.map((r) => (
+            <option value="">Select route</option>
+            {Object.keys(routes).map((r) => (
               <option key={r} value={r}>{r}</option>
             ))}
           </select>
@@ -60,45 +68,42 @@ export default function Playground() {
           <select
             value={method}
             onChange={(e) => setMethod(e.target.value)}
-            className="bg-black border border-gray-700 px-3 py-2 rounded-md"
+            className="bg-[#101010] border border-gray-700 rounded px-3 py-2"
           >
             <option>GET</option>
             <option>POST</option>
-            <option>PUT</option>
-            <option>DELETE</option>
           </select>
+
+          <button
+            onClick={run}
+            disabled={running}
+            className="px-6 py-2 bg-blue-600 hover:bg-blue-700 rounded text-white"
+          >
+            {running ? "Running..." : "Run"}
+          </button>
         </div>
 
-        {/* Body */}
         <textarea
-          placeholder="Request body..."
           value={body}
           onChange={(e) => setBody(e.target.value)}
-          className="bg-black border border-gray-700 w-full h-40 p-3 rounded-md mb-4"
+          placeholder="Request body"
+          className="w-full h-32 bg-[#101010] border border-gray-700 rounded p-3 mb-4"
         />
 
-        <button
-          onClick={runWorker}
-          className="px-6 py-2 bg-blue-600 text-white rounded-lg"
-        >
-          Run
-        </button>
+        <div className="bg-black border border-gray-700 rounded p-4 text-green-400 whitespace-pre-wrap">
+          {output || "Output will appear here"}
+        </div>
       </div>
 
-      {/* Output */}
-      <h2 className="text-xl font-semibold mt-10 mb-2">Output</h2>
-      <pre className="bg-black border border-gray-800 p-4 rounded-lg h-20 overflow-auto">
-        {output || "No output yet."}
-      </pre>
+      <div className="bg-[#181818] border border-gray-800 rounded-xl p-6">
+        <h2 className="text-xl font-semibold mb-4">Logs</h2>
 
-      {/* Logs */}
-      <h2 className="text-xl font-semibold mt-10 mb-2">Logs</h2>
-      <div className="bg-black border border-gray-800 p-4 rounded-lg h-60 overflow-auto">
-        {logs.map((log, i) => (
-          <p key={i} className={log.type === "error" ? "text-red-400" : "text-gray-300"}>
-            {new Date(log.time).toLocaleTimeString()} — {log.message}
-          </p>
-        ))}
+        <div className="bg-black rounded p-4 text-sm h-64 overflow-auto">
+          {logs.length === 0 && <p className="text-gray-500">No logs yet</p>}
+          {logs.map((l, i) => (
+            <div key={i} className="mb-1">{l}</div>
+          ))}
+        </div>
       </div>
     </div>
   );

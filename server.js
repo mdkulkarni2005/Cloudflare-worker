@@ -1,5 +1,4 @@
 import { readFileSync, writeFileSync, existsSync, readdirSync } from "fs";
-import fs from "fs";
 import path from "path";
 import vm from "vm";
 import { fileURLToPath } from "url";
@@ -19,15 +18,29 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Methods": "*"
 };
 
-let LOGS = [];
+const LOGS = [];
+const METRICS = {};
 
 function pushLog(type, message) {
   LOGS.push({ type, message, time: Date.now() });
   if (LOGS.length > 300) LOGS.shift();
 }
 
-function getLogs() {
-  return LOGS.slice(-200);
+function recordMetric(worker, duration, error = false) {
+  if (!METRICS[worker]) {
+    METRICS[worker] = {
+      requests: 0,
+      errors: 0,
+      totalTime: 0,
+      lastRequest: null
+    };
+  }
+
+  const m = METRICS[worker];
+  m.requests++;
+  m.totalTime += duration;
+  m.lastRequest = Date.now();
+  if (error) m.errors++;
 }
 
 function loadRoutes() {
@@ -53,7 +66,9 @@ function kvDelete(key) {
 }
 
 function createSandbox() {
-  const ctx = {
+  return vm.createContext({
+    fetch,
+    globalThis: {},
     console: {
       log: (...args) => {
         const msg = "[worker] " + args.join(" ");
@@ -65,12 +80,8 @@ function createSandbox() {
         console.error(msg);
         pushLog("error", msg);
       }
-    },
-    fetch,
-    globalThis: {}
-  };
-
-  return vm.createContext(ctx);
+    }
+  });
 }
 
 function loadWorker(name) {
@@ -109,18 +120,12 @@ function matchRoute(pathname, routes) {
 
     const p = pattern.split("/").filter(Boolean);
     const u = pathname.split("/").filter(Boolean);
-
     if (p.length !== u.length) continue;
 
     let ok = true;
-
     for (let i = 0; i < p.length; i++) {
-      if (p[i].startsWith(":")) {
-        params[p[i].slice(1)] = u[i];
-      } else if (p[i] !== u[i]) {
-        ok = false;
-        break;
-      }
+      if (p[i].startsWith(":")) params[p[i].slice(1)] = u[i];
+      else if (p[i] !== u[i]) ok = false;
     }
 
     if (ok) return { worker, params };
@@ -137,12 +142,6 @@ Bun.serve({
 
     if (req.method === "OPTIONS") {
       return new Response(null, { headers: CORS_HEADERS });
-    }
-
-    if (url.pathname === "/__logs") {
-      return new Response(JSON.stringify(getLogs()), {
-        headers: { "content-type": "application/json", ...CORS_HEADERS }
-      });
     }
 
     if (url.pathname === "/api/workers/list") {
@@ -190,46 +189,42 @@ Bun.serve({
       return new Response("OK", { headers: CORS_HEADERS });
     }
 
-    if (url.pathname === "/__run") {
-      const { route, method, body } = await req.json();
-      const match = matchRoute(route, loadRoutes());
-      if (!match) return new Response("Route not found", { status: 404 });
-
-      const output = await runWorker(
-        match.worker,
-        { method, path: route, params: match.params },
-        body
-      );
-
-      return new Response(output, { headers: CORS_HEADERS });
+    if (url.pathname === "/api/metrics") {
+      return new Response(JSON.stringify(METRICS), {
+        headers: { "content-type": "application/json", ...CORS_HEADERS }
+      });
     }
 
     const match = matchRoute(url.pathname, loadRoutes());
 
     if (match) {
       const body = await req.text();
-
-      const reqObj = {
-        method: req.method,
-        path: url.pathname,
-        params: match.params,
-        query: Object.fromEntries(url.searchParams),
-        headers: Object.fromEntries(req.headers),
-        body
-      };
+      const start = Date.now();
 
       try {
-        const output = await runWorker(match.worker, reqObj, body);
+        const output = await runWorker(
+          match.worker,
+          {
+            method: req.method,
+            path: url.pathname,
+            params: match.params,
+            query: Object.fromEntries(url.searchParams),
+            headers: Object.fromEntries(req.headers)
+          },
+          body
+        );
+
+        recordMetric(match.worker, Date.now() - start);
         return new Response(output, {
           headers: { "content-type": "text/plain", ...CORS_HEADERS }
         });
       } catch (e) {
+        recordMetric(match.worker, Date.now() - start, true);
         pushLog("error", e.message);
         return new Response("Runtime Error: " + e.message, { status: 500 });
       }
     }
 
-    pushLog("error", "404 " + url.pathname);
     return new Response("404 Not Found", { status: 404 });
   }
 });
