@@ -13,15 +13,16 @@ export default function LogsPage() {
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    const id = setInterval(async () => {
-      try {
-        const res = await fetch("http://localhost:3000/__logs");
-        const data = await res.json();
-        setLogs(data);
-      } catch {}
-    }, 1000);
+    const es = new EventSource("http://localhost:3000/api/logs/stream");
 
-    return () => clearInterval(id);
+    es.onmessage = (e) => {
+      const chunk: Log[] = JSON.parse(e.data || "[]");
+      setLogs(prev => [...prev, ...chunk]);
+    };
+
+    es.onerror = () => es.close();
+
+    return () => es.close();
   }, []);
 
   useEffect(() => {
@@ -30,26 +31,17 @@ export default function LogsPage() {
 
   return (
     <div>
-      <h1 className="text-3xl font-bold mb-6">Logs</h1>
+      <h1 className="text-3xl font-bold mb-6">Live Logs</h1>
 
-      <div className="bg-black border border-gray-800 rounded-xl p-4 h-[70vh] overflow-auto font-mono text-sm">
-        {logs.length === 0 && (
-          <p className="text-gray-500">No logs yet</p>
-        )}
-
-        {logs.map((log, i) => (
+      <div className="bg-black border border-gray-800 rounded-xl p-4 h-[70vh] overflow-y-auto font-mono text-sm">
+        {logs.map((l, i) => (
           <div
             key={i}
-            className={
-              log.type === "error"
-                ? "text-red-400 mb-1"
-                : "text-gray-300 mb-1"
-            }
+            className={l.type === "error" ? "text-red-400" : "text-gray-200"}
           >
-            [{new Date(log.time).toLocaleTimeString()}] {log.message}
+            [{new Date(l.time).toLocaleTimeString()}] {l.message}
           </div>
         ))}
-
         <div ref={bottomRef} />
       </div>
     </div>
