@@ -2,12 +2,12 @@ import "./globals.css";
 import Link from "next/link";
 import { ReactNode } from "react";
 import "@fontsource/inter";
+import { InspectorProvider } from "@/providers/InspectorProvider";
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en">
       <body className="bg-[#0e0e0e] text-gray-200 flex h-screen">
-        
         {/* SIDEBAR */}
         <aside className="w-64 bg-[#131313] border-r border-gray-800 p-6 flex flex-col fixed h-full shadow-lg">
           <h1 className="text-2xl font-bold mb-10 bg-linear-to-r from-purple-400 to-blue-400 bg-clip-text text-transparent">
@@ -22,6 +22,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
             <NavItem name="Logs" href="/logs" />
             <NavItem name="Playground" href="/playground" />
             <NavItem name="Metrics" href="/metrics" />
+            <NavItem name="Traffic" href="/traffic" />
           </nav>
 
           <footer className="mt-auto text-sm text-gray-500">
@@ -31,7 +32,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
 
         {/* MAIN CONTENT */}
         <main className="flex-1 ml-64 p-12 overflow-auto">
-          {children}
+          <InspectorProvider>{children}</InspectorProvider>
         </main>
       </body>
     </html>

@@ -16,12 +16,11 @@ export default function LogsPage() {
     const es = new EventSource("http://localhost:3000/api/logs/stream");
 
     es.onmessage = (e) => {
-      const chunk: Log[] = JSON.parse(e.data || "[]");
-      setLogs(prev => [...prev, ...chunk]);
+      const log: Log = JSON.parse(e.data);
+      setLogs((prev) => [...prev, log]);
     };
 
     es.onerror = () => es.close();
-
     return () => es.close();
   }, []);
 
@@ -35,10 +34,7 @@ export default function LogsPage() {
 
       <div className="bg-black border border-gray-800 rounded-xl p-4 h-[70vh] overflow-y-auto font-mono text-sm">
         {logs.map((l, i) => (
-          <div
-            key={i}
-            className={l.type === "error" ? "text-red-400" : "text-gray-200"}
-          >
+          <div key={i} className={l.type === "error" ? "text-red-400" : "text-gray-200"}>
             [{new Date(l.time).toLocaleTimeString()}] {l.message}
           </div>
         ))}

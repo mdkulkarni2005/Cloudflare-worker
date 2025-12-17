@@ -6,17 +6,26 @@ export default function MetricsPage() {
   const [metrics, setMetrics] = useState<any>(null);
 
   useEffect(() => {
-    const load = () =>
-        fetch("http://localhost:3000/api/metrics")
-        .then(res => res.json())
-        .then(setMetrics)
-        .catch(console.error);
-  
+    const load = async () => {
+      try {
+        const res = await fetch("/api/metrics");
+        if (!res.ok) {
+          setMetrics(null);
+          return;
+        }
+
+        const data = await res.json();
+        setMetrics(data);
+      } catch (err) {
+        console.error(err);
+        setMetrics(null);
+      }
+    };
+
     load();
     const id = setInterval(load, 3000);
     return () => clearInterval(id);
   }, []);
-  
 
   if (!metrics) {
     return <p className="text-gray-400">Loading metrics...</p>;

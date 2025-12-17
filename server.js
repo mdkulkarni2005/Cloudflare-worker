@@ -1,187 +1,271 @@
-import { readFileSync, writeFileSync, existsSync, readdirSync } from "fs";
-import path from "path";
-import vm from "vm";
-import { fileURLToPath } from "url";
+import { randomUUID } from "crypto";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const PORT = 3000;
 
-const WORKERS_DIR = path.join(__dirname, "workers");
-const ROUTES_JSON = path.join(__dirname, "routes.json");
-const KV_JSON = path.join(__dirname, "kv.json");
-
-if (!existsSync(KV_JSON)) writeFileSync(KV_JSON, "{}");
-
-const CORS_HEADERS = {
+const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "*",
-  "Access-Control-Allow-Methods": "*"
+  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
 };
 
-let TRAFFIC = [];
-let LOGS = [];
+const PLANS = {
+  free: { requests: 1000, workers: 3, kvKeys: 50, kvValue: 10_000 },
+  pro: { requests: 100_000, workers: 20, kvKeys: 1000, kvValue: 100_000 },
+  team: {
+    requests: 1_000_000,
+    workers: 100,
+    kvKeys: 10_000,
+    kvValue: 1_000_000,
+  },
+};
 
-function pushLog(type, message) {
-  LOGS.push({ type, message, time: Date.now() });
-  if (LOGS.length > 300) LOGS.shift();
+const projects = new Map();
+const workers = new Map();
+const kvStore = new Map();
+const trafficStore = [];
+const sseClients = new Set();
+
+/* ---------------- helpers ---------------- */
+
+const today = () => new Date().toISOString().slice(0, 10);
+
+const json = (d, s = 200) =>
+  new Response(JSON.stringify(d), {
+    status: s,
+    headers: { "Content-Type": "application/json", ...CORS },
+  });
+
+const text = (d, s = 200) => new Response(d, { status: s, headers: CORS });
+
+function broadcast(evt) {
+  const msg = `data: ${JSON.stringify(evt)}\n\n`;
+  for (const c of sseClients) {
+    try {
+      c.enqueue(msg);
+    } catch {}
+  }
 }
 
-function recordTraffic(entry) {
-  TRAFFIC.unshift(entry);
-  if (TRAFFIC.length > 200) TRAFFIC.pop();
+function recordTraffic(t) {
+  trafficStore.unshift(t);
+  if (trafficStore.length > 500) trafficStore.pop();
+  broadcast({ type: "traffic", payload: t });
 }
 
-function loadRoutes() {
-  return existsSync(ROUTES_JSON)
-    ? JSON.parse(readFileSync(ROUTES_JSON, "utf8"))
-    : {};
+/* ---------------- auth ---------------- */
+
+function getProject(req) {
+  const auth = req.headers.get("authorization");
+  if (!auth) return null;
+  return projects.get(auth.replace("Bearer ", "")) || null;
 }
 
-function kvGet(key) {
-  return JSON.parse(readFileSync(KV_JSON, "utf8"))[key] ?? null;
+function enforceRequests(project) {
+  const plan = PLANS[project.plan];
+  if (project.usage.day !== today()) {
+    project.usage.day = today();
+    project.usage.count = 0;
+  }
+  if (project.usage.count >= plan.requests) return false;
+  project.usage.count++;
+  return true;
 }
 
-function kvPut(key, value) {
-  const data = JSON.parse(readFileSync(KV_JSON, "utf8"));
-  data[key] = value;
-  writeFileSync(KV_JSON, JSON.stringify(data, null, 2));
+/* ---------------- KV ---------------- */
+
+function getKV(project) {
+  if (!kvStore.has(project.token)) {
+    kvStore.set(project.token, new Map());
+  }
+  return kvStore.get(project.token);
 }
 
-function createSandbox() {
-  const ctx = {
-    console: {
-      log: (...args) => pushLog("log", args.join(" ")),
-      error: (...args) => pushLog("error", args.join(" "))
+function createKVAPI(project) {
+  const plan = PLANS[project.plan];
+  const store = getKV(project);
+
+  return {
+    get(key) {
+      return store.get(key) ?? null;
     },
-    fetch,
-    globalThis: {}
+
+    put(key, value) {
+      const size = new TextEncoder().encode(
+        typeof value === "string" ? value : JSON.stringify(value)
+      ).length;
+
+      if (!store.has(key) && store.size >= plan.kvKeys) {
+        throw new Error("KV key limit exceeded");
+      }
+
+      if (size > plan.kvValue) {
+        throw new Error("KV value too large");
+      }
+
+      store.set(key, value);
+    },
+
+    delete(key) {
+      store.delete(key);
+    },
   };
-  return vm.createContext(ctx);
 }
 
-function loadWorker(name) {
-  const file = path.join(WORKERS_DIR, `${name}.js`);
-  if (!existsSync(file)) throw new Error("Worker not found");
-  return readFileSync(file, "utf8");
+/* ---------------- SSE ---------------- */
+
+function inspectorStream() {
+  const stream = new ReadableStream({
+    start(ctrl) {
+      sseClients.add(ctrl);
+      ctrl.enqueue(`data: ${JSON.stringify({ type: "connected" })}\n\n`);
+      return () => sseClients.delete(ctrl);
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      ...CORS,
+    },
+  });
 }
 
-async function runWorker(name, req, body) {
-  const code = loadWorker(name);
-  const ctx = createSandbox();
-  ctx.KV = { get: kvGet, put: kvPut, delete: () => {} };
-  vm.runInContext(code, ctx);
+/* ---------------- server ---------------- */
 
-  const handler = ctx.handle || ctx.globalThis.handle;
-  if (typeof handler !== "function") {
-    throw new Error("Worker missing globalThis.handle");
+async function handle(req) {
+  const start = Date.now();
+  const url = new URL(req.url);
+
+  if (req.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: CORS });
   }
 
-  return await handler(req, body);
-}
+  if (url.pathname === "/api/inspect/stream") {
+    return inspectorStream();
+  }
 
-function matchRoute(pathname, routes) {
-  for (const [pattern, worker] of Object.entries(routes)) {
-    const p = pattern.split("/").filter(Boolean);
-    const u = pathname.split("/").filter(Boolean);
-    if (p.length !== u.length) continue;
+  if (url.pathname === "/api/traffic") {
+    return json(trafficStore);
+  }
 
-    const params = {};
-    let ok = true;
+  if (url.pathname === "/api/projects/create") {
+    const { name } = await req.json();
+    const token = `proj_${randomUUID()}`;
 
-    for (let i = 0; i < p.length; i++) {
-      if (p[i].startsWith(":")) {
-        params[p[i].slice(1)] = u[i];
-      } else if (p[i] !== u[i]) {
-        ok = false;
-        break;
-      }
+    projects.set(token, {
+      token,
+      name,
+      plan: "free",
+      usage: { day: today(), count: 0 },
+      workers: new Set(),
+    });
+
+    return json({ token });
+  }
+
+  // -------------------- GITHUB WEBHOOK --------------------
+  if (url.pathname === "/api/webhooks/github") {
+    const payload = await req.json();
+
+    const repo = payload?.repository?.full_name;
+    const branch = payload?.ref;
+    const commit = payload?.after;
+
+    console.log("🔔 GitHub Webhook Received");
+    console.log("Repo:", repo);
+    console.log("Branch:", branch);
+    console.log("Commit:", commit);
+
+    recordTraffic({
+      id: crypto.randomUUID(),
+      time: Date.now(),
+      route: "/api/webhooks/github",
+      worker: "github",
+      method: "POST",
+      status: "ok",
+      duration: Date.now() - start,
+      request: { body: payload },
+      response: { body: "Webhook received" },
+      error: null,
+    });
+
+    return json({ ok: true });
+  }
+
+  const project = getProject(req);
+  if (!project) return json({ error: "Unauthorized" }, 401);
+
+  if (!enforceRequests(project)) {
+    return json({ error: "Request quota exceeded" }, 429);
+  }
+
+  if (url.pathname === "/api/workers/deploy") {
+    const { name, code } = await req.json();
+    const plan = PLANS[project.plan];
+
+    if (project.workers.size >= plan.workers) {
+      return json({ error: "Worker limit exceeded" }, 403);
     }
 
-    if (ok) return { worker, params };
+    workers.set(name, { code, owner: project });
+    project.workers.add(name);
+
+    return json({ deployed: name });
   }
-  return null;
+
+  try {
+    if (url.pathname === "/hi") {
+      const body = await req.text();
+
+      recordTraffic({
+        id: randomUUID(),
+        route: "/hi",
+        worker: "hello",
+        method: req.method,
+        status: "ok",
+        duration: Date.now() - start,
+      });
+
+      return text(body || "hi");
+    }
+
+    if (url.pathname.startsWith("/todo/")) {
+      const id = url.pathname.split("/")[2];
+
+      recordTraffic({
+        id: randomUUID(),
+        route: `/todo/${id}`,
+        worker: "todo",
+        method: req.method,
+        status: "ok",
+        duration: Date.now() - start,
+      });
+
+      return text(`Todo ID: ${id}`);
+    }
+  } catch (e) {
+    recordTraffic({
+      id: randomUUID(),
+      route: url.pathname,
+      worker: "unknown",
+      method: req.method,
+      status: "error",
+      duration: Date.now() - start,
+      error: e.message,
+    });
+
+    return text("Runtime Error", 500);
+  }
+
+  return text("404 Not Found", 404);
 }
 
 Bun.serve({
-  port: 3000,
-
-  async fetch(req) {
-    const start = performance.now();
-    const url = new URL(req.url);
-
-    if (req.method === "OPTIONS") {
-      return new Response(null, { headers: CORS_HEADERS });
-    }
-
-    if (url.pathname === "/api/traffic") {
-      return new Response(JSON.stringify(TRAFFIC), {
-        headers: { "content-type": "application/json", ...CORS_HEADERS }
-      });
-    }
-
-    if (url.pathname.startsWith("/api/traffic/")) {
-      const id = url.pathname.split("/").pop();
-      const entry = TRAFFIC.find(t => t.id === id);
-      return new Response(JSON.stringify(entry ?? null), {
-        headers: { "content-type": "application/json", ...CORS_HEADERS }
-      });
-    }
-
-    const match = matchRoute(url.pathname, loadRoutes());
-
-    if (match) {
-      const body = await req.text();
-      let status = "ok";
-      let result = "";
-      let error = null;
-
-      try {
-        result = await runWorker(
-          match.worker,
-          {
-            method: req.method,
-            path: url.pathname,
-            params: match.params,
-            query: Object.fromEntries(url.searchParams),
-            headers: Object.fromEntries(req.headers)
-          },
-          body
-        );
-      } catch (e) {
-        status = "error";
-        error = e.message;
-        result = "Runtime Error";
-      }
-
-      const duration = Math.round(performance.now() - start);
-
-      recordTraffic({
-        id: crypto.randomUUID(),
-        time: Date.now(),
-        route: url.pathname,
-        worker: match.worker,
-        method: req.method,
-        status,
-        duration,
-        request: {
-          headers: Object.fromEntries(req.headers),
-          query: Object.fromEntries(url.searchParams),
-          body: body.slice(0, 2000)
-        },
-        response: {
-          body: String(result).slice(0, 2000)
-        },
-        error
-      });
-
-      return new Response(result, {
-        headers: { "content-type": "text/plain", ...CORS_HEADERS },
-        status: status === "ok" ? 200 : 500
-      });
-    }
-
-    return new Response("404 Not Found", { status: 404 });
-  }
+  port: PORT,
+  idleTimeout: 0,
+  fetch: handle,
 });
 
-console.log("🔥 Mini Edge Runtime running at http://localhost:3000");
+console.log(`🔥 Mini Edge Runtime running at http://localhost:${PORT}`);
