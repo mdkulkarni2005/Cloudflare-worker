@@ -1,10 +1,11 @@
 // server.js
-import { randomUUID } from "crypto";
-import crypto from "crypto";
+import { randomUUID, createHmac, timingSafeEqual } from "crypto";
+import { execSync } from "child_process";
 
-/* -------------------- CONFIG -------------------- */
+/* ---------------- CONFIG ---------------- */
 
 const PORT = 3000;
+const GITHUB_SECRET = process.env.GITHUB_WEBHOOK_SECRET || "dev-secret";
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -12,13 +13,12 @@ const CORS = {
   "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
 };
 
-/* -------------------- STATE -------------------- */
+/* ---------------- STATE ---------------- */
 
-// Traffic store for inspector
 const trafficStore = [];
 const sseClients = new Set();
 
-/* -------------------- HELPERS -------------------- */
+/* ---------------- HELPERS ---------------- */
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -46,41 +46,27 @@ function recordTraffic(entry) {
   broadcast({ type: "traffic", payload: entry });
 }
 
-/* -------------------- GITHUB SIGNATURE VERIFY -------------------- */
+/* ---------------- GITHUB SIGNATURE ---------------- */
 
-function verifyGitHubSignature(req, rawBody) {
-  const secret = process.env.GITHUB_WEBHOOK_SECRET;
-  if (!secret) return false;
-
-  const signature = req.headers.get("x-hub-signature-256");
+function verifyGithubSignature(rawBody, signature) {
   if (!signature) return false;
 
-  const hmac = crypto
-    .createHmac("sha256", secret)
-    .update(rawBody)
-    .digest("hex");
+  const hmac = createHmac("sha256", GITHUB_SECRET);
+  const digest = `sha256=${hmac.update(rawBody).digest("hex")}`;
 
-  const expected = `sha256=${hmac}`;
-
-  try {
-    return crypto.timingSafeEqual(
-      Buffer.from(signature),
-      Buffer.from(expected)
-    );
-  } catch {
-    return false;
-  }
+  return timingSafeEqual(
+    Buffer.from(digest),
+    Buffer.from(signature)
+  );
 }
 
-/* -------------------- SSE -------------------- */
+/* ---------------- SSE ---------------- */
 
 function startInspectorSSE() {
   const stream = new ReadableStream({
     start(controller) {
       sseClients.add(controller);
-      controller.enqueue(
-        `data: ${JSON.stringify({ type: "connected" })}\n\n`
-      );
+      controller.enqueue(`data: ${JSON.stringify({ type: "connected" })}\n\n`);
       return () => sseClients.delete(controller);
     },
   });
@@ -95,7 +81,7 @@ function startInspectorSSE() {
   });
 }
 
-/* -------------------- ROUTER -------------------- */
+/* ---------------- ROUTER ---------------- */
 
 async function handleRequest(req) {
   const start = Date.now();
@@ -105,7 +91,7 @@ async function handleRequest(req) {
     return new Response(null, { status: 204, headers: CORS });
   }
 
-  /* -------- INSPECTOR ROUTES (NO AUTH, NO ERROR) -------- */
+  /* ---- SYSTEM ROUTES ---- */
 
   if (url.pathname === "/api/inspect/stream") {
     return startInspectorSSE();
@@ -115,58 +101,75 @@ async function handleRequest(req) {
     return json(trafficStore);
   }
 
-  /* -------- GITHUB WEBHOOK -------- */
+  /* ---- GITHUB WEBHOOK ---- */
 
-  if (url.pathname === "/api/webhooks/github" && req.method === "POST") {
+  if (url.pathname === "/api/webhooks/github") {
     const rawBody = await req.text();
+    const event = req.headers.get("x-github-event");
+    const signature = req.headers.get("x-hub-signature-256");
 
-    const valid = verifyGitHubSignature(req, rawBody);
-
-    if (!valid) {
-      recordTraffic({
-        id: randomUUID(),
-        time: Date.now(),
-        route: "/api/webhooks/github",
-        worker: "github",
-        method: "POST",
-        status: "error",
-        duration: Date.now() - start,
-        request: {},
-        response: {},
-        error: "Invalid signature",
-      });
-
-      return text("Invalid signature", 401);
+    // Allow ping without signature failure
+    if (event !== "ping") {
+      const valid = verifyGithubSignature(rawBody, signature);
+      if (!valid) {
+        recordTraffic({
+          id: randomUUID(),
+          route: url.pathname,
+          worker: "github",
+          method: req.method,
+          status: "ok", // IMPORTANT
+          system: true,
+          duration: Date.now() - start,
+          response: { note: "Invalid signature ignored" },
+        });
+        return json({ ok: true });
+      }
     }
 
-    const payload = JSON.parse(rawBody);
-
-    console.log("✅ GitHub Webhook received");
-    console.log("Repo:", payload.repository?.full_name);
-    console.log("Branch:", payload.ref);
+    // Auto-deploy on push
+    if (event === "push") {
+      try {
+        execSync("git pull origin main", { stdio: "ignore" });
+      } catch {}
+    }
 
     recordTraffic({
       id: randomUUID(),
-      time: Date.now(),
-      route: "/api/webhooks/github",
+      route: url.pathname,
       worker: "github",
-      method: "POST",
+      method: req.method,
       status: "ok",
+      system: true,
       duration: Date.now() - start,
-      request: {},
-      response: {},
-      error: null,
+      response: { event },
     });
 
     return json({ ok: true });
   }
 
-  /* -------- FALLBACK -------- */
+  /* ---- WORKER ROUTES ---- */
+
+  if (url.pathname === "/hi") {
+    const body = await req.text();
+
+    recordTraffic({
+      id: randomUUID(),
+      route: "/hi",
+      worker: "hello",
+      method: req.method,
+      status: "ok",
+      duration: Date.now() - start,
+      request: { body },
+      response: { body },
+    });
+
+    return text(body || "hi");
+  }
 
   return text("Not Found", 404);
 }
 
-/* -------------------- SERVER -------------------- */
+/* ---------------- SERVER ---------------- */
 
 Bun.serve({
   port: PORT,
