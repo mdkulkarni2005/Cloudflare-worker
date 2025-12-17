@@ -1,4 +1,8 @@
+// server.js
 import { randomUUID } from "crypto";
+import crypto from "crypto";
+
+/* -------------------- CONFIG -------------------- */
 
 const PORT = 3000;
 
@@ -8,117 +12,76 @@ const CORS = {
   "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
 };
 
-const PLANS = {
-  free: { requests: 1000, workers: 3, kvKeys: 50, kvValue: 10_000 },
-  pro: { requests: 100_000, workers: 20, kvKeys: 1000, kvValue: 100_000 },
-  team: {
-    requests: 1_000_000,
-    workers: 100,
-    kvKeys: 10_000,
-    kvValue: 1_000_000,
-  },
-};
+/* -------------------- STATE -------------------- */
 
-const projects = new Map();
-const workers = new Map();
-const kvStore = new Map();
+// Traffic store for inspector
 const trafficStore = [];
 const sseClients = new Set();
 
-/* ---------------- helpers ---------------- */
+/* -------------------- HELPERS -------------------- */
 
-const today = () => new Date().toISOString().slice(0, 10);
-
-const json = (d, s = 200) =>
-  new Response(JSON.stringify(d), {
-    status: s,
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
     headers: { "Content-Type": "application/json", ...CORS },
   });
+}
 
-const text = (d, s = 200) => new Response(d, { status: s, headers: CORS });
+function text(data, status = 200) {
+  return new Response(data, { status, headers: CORS });
+}
 
-function broadcast(evt) {
-  const msg = `data: ${JSON.stringify(evt)}\n\n`;
-  for (const c of sseClients) {
+function broadcast(event) {
+  const payload = `data: ${JSON.stringify(event)}\n\n`;
+  for (const client of sseClients) {
     try {
-      c.enqueue(msg);
+      client.enqueue(payload);
     } catch {}
   }
 }
 
-function recordTraffic(t) {
-  trafficStore.unshift(t);
+function recordTraffic(entry) {
+  trafficStore.unshift(entry);
   if (trafficStore.length > 500) trafficStore.pop();
-  broadcast({ type: "traffic", payload: t });
+  broadcast({ type: "traffic", payload: entry });
 }
 
-/* ---------------- auth ---------------- */
+/* -------------------- GITHUB SIGNATURE VERIFY -------------------- */
 
-function getProject(req) {
-  const auth = req.headers.get("authorization");
-  if (!auth) return null;
-  return projects.get(auth.replace("Bearer ", "")) || null;
-}
+function verifyGitHubSignature(req, rawBody) {
+  const secret = process.env.GITHUB_WEBHOOK_SECRET;
+  if (!secret) return false;
 
-function enforceRequests(project) {
-  const plan = PLANS[project.plan];
-  if (project.usage.day !== today()) {
-    project.usage.day = today();
-    project.usage.count = 0;
+  const signature = req.headers.get("x-hub-signature-256");
+  if (!signature) return false;
+
+  const hmac = crypto
+    .createHmac("sha256", secret)
+    .update(rawBody)
+    .digest("hex");
+
+  const expected = `sha256=${hmac}`;
+
+  try {
+    return crypto.timingSafeEqual(
+      Buffer.from(signature),
+      Buffer.from(expected)
+    );
+  } catch {
+    return false;
   }
-  if (project.usage.count >= plan.requests) return false;
-  project.usage.count++;
-  return true;
 }
 
-/* ---------------- KV ---------------- */
+/* -------------------- SSE -------------------- */
 
-function getKV(project) {
-  if (!kvStore.has(project.token)) {
-    kvStore.set(project.token, new Map());
-  }
-  return kvStore.get(project.token);
-}
-
-function createKVAPI(project) {
-  const plan = PLANS[project.plan];
-  const store = getKV(project);
-
-  return {
-    get(key) {
-      return store.get(key) ?? null;
-    },
-
-    put(key, value) {
-      const size = new TextEncoder().encode(
-        typeof value === "string" ? value : JSON.stringify(value)
-      ).length;
-
-      if (!store.has(key) && store.size >= plan.kvKeys) {
-        throw new Error("KV key limit exceeded");
-      }
-
-      if (size > plan.kvValue) {
-        throw new Error("KV value too large");
-      }
-
-      store.set(key, value);
-    },
-
-    delete(key) {
-      store.delete(key);
-    },
-  };
-}
-
-/* ---------------- SSE ---------------- */
-
-function inspectorStream() {
+function startInspectorSSE() {
   const stream = new ReadableStream({
-    start(ctrl) {
-      sseClients.add(ctrl);
-      ctrl.enqueue(`data: ${JSON.stringify({ type: "connected" })}\n\n`);
-      return () => sseClients.delete(ctrl);
+    start(controller) {
+      sseClients.add(controller);
+      controller.enqueue(
+        `data: ${JSON.stringify({ type: "connected" })}\n\n`
+      );
+      return () => sseClients.delete(controller);
     },
   });
 
@@ -132,9 +95,9 @@ function inspectorStream() {
   });
 }
 
-/* ---------------- server ---------------- */
+/* -------------------- ROUTER -------------------- */
 
-async function handle(req) {
+async function handleRequest(req) {
   const start = Date.now();
   const url = new URL(req.url);
 
@@ -142,130 +105,73 @@ async function handle(req) {
     return new Response(null, { status: 204, headers: CORS });
   }
 
+  /* -------- INSPECTOR ROUTES (NO AUTH, NO ERROR) -------- */
+
   if (url.pathname === "/api/inspect/stream") {
-    return inspectorStream();
+    return startInspectorSSE();
   }
 
   if (url.pathname === "/api/traffic") {
     return json(trafficStore);
   }
 
-  if (url.pathname === "/api/projects/create") {
-    const { name } = await req.json();
-    const token = `proj_${randomUUID()}`;
+  /* -------- GITHUB WEBHOOK -------- */
 
-    projects.set(token, {
-      token,
-      name,
-      plan: "free",
-      usage: { day: today(), count: 0 },
-      workers: new Set(),
-    });
+  if (url.pathname === "/api/webhooks/github" && req.method === "POST") {
+    const rawBody = await req.text();
 
-    return json({ token });
-  }
+    const valid = verifyGitHubSignature(req, rawBody);
 
-  // -------------------- GITHUB WEBHOOK --------------------
-  if (url.pathname === "/api/webhooks/github") {
-    const payload = await req.json();
+    if (!valid) {
+      recordTraffic({
+        id: randomUUID(),
+        time: Date.now(),
+        route: "/api/webhooks/github",
+        worker: "github",
+        method: "POST",
+        status: "error",
+        duration: Date.now() - start,
+        request: {},
+        response: {},
+        error: "Invalid signature",
+      });
 
-    const repo = payload?.repository?.full_name;
-    const branch = payload?.ref;
-    const commit = payload?.after;
+      return text("Invalid signature", 401);
+    }
 
-    console.log("🔔 GitHub Webhook Received");
-    console.log("Repo:", repo);
-    console.log("Branch:", branch);
-    console.log("Commit:", commit);
+    const payload = JSON.parse(rawBody);
+
+    console.log("✅ GitHub Webhook received");
+    console.log("Repo:", payload.repository?.full_name);
+    console.log("Branch:", payload.ref);
 
     recordTraffic({
-      id: crypto.randomUUID(),
+      id: randomUUID(),
       time: Date.now(),
       route: "/api/webhooks/github",
       worker: "github",
       method: "POST",
       status: "ok",
       duration: Date.now() - start,
-      request: { body: payload },
-      response: { body: "Webhook received" },
+      request: {},
+      response: {},
       error: null,
     });
 
     return json({ ok: true });
   }
 
-  const project = getProject(req);
-  if (!project) return json({ error: "Unauthorized" }, 401);
+  /* -------- FALLBACK -------- */
 
-  if (!enforceRequests(project)) {
-    return json({ error: "Request quota exceeded" }, 429);
-  }
-
-  if (url.pathname === "/api/workers/deploy") {
-    const { name, code } = await req.json();
-    const plan = PLANS[project.plan];
-
-    if (project.workers.size >= plan.workers) {
-      return json({ error: "Worker limit exceeded" }, 403);
-    }
-
-    workers.set(name, { code, owner: project });
-    project.workers.add(name);
-
-    return json({ deployed: name });
-  }
-
-  try {
-    if (url.pathname === "/hi") {
-      const body = await req.text();
-
-      recordTraffic({
-        id: randomUUID(),
-        route: "/hi",
-        worker: "hello",
-        method: req.method,
-        status: "ok",
-        duration: Date.now() - start,
-      });
-
-      return text(body || "hi");
-    }
-
-    if (url.pathname.startsWith("/todo/")) {
-      const id = url.pathname.split("/")[2];
-
-      recordTraffic({
-        id: randomUUID(),
-        route: `/todo/${id}`,
-        worker: "todo",
-        method: req.method,
-        status: "ok",
-        duration: Date.now() - start,
-      });
-
-      return text(`Todo ID: ${id}`);
-    }
-  } catch (e) {
-    recordTraffic({
-      id: randomUUID(),
-      route: url.pathname,
-      worker: "unknown",
-      method: req.method,
-      status: "error",
-      duration: Date.now() - start,
-      error: e.message,
-    });
-
-    return text("Runtime Error", 500);
-  }
-
-  return text("404 Not Found", 404);
+  return text("Not Found", 404);
 }
+
+/* -------------------- SERVER -------------------- */
 
 Bun.serve({
   port: PORT,
   idleTimeout: 0,
-  fetch: handle,
+  fetch: handleRequest,
 });
 
 console.log(`🔥 Mini Edge Runtime running at http://localhost:${PORT}`);
