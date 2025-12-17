@@ -54,10 +54,7 @@ function verifyGithubSignature(rawBody, signature) {
   const hmac = createHmac("sha256", GITHUB_SECRET);
   const digest = `sha256=${hmac.update(rawBody).digest("hex")}`;
 
-  return timingSafeEqual(
-    Buffer.from(digest),
-    Buffer.from(signature)
-  );
+  return timingSafeEqual(Buffer.from(digest), Buffer.from(signature));
 }
 
 /* ---------------- SSE ---------------- */
@@ -100,6 +97,21 @@ async function handleRequest(req) {
   if (url.pathname === "/api/traffic") {
     return json(trafficStore);
   }
+
+  // 🔍 INSPECT SINGLE TRAFFIC EVENT
+  app.get("/api/traffic/:id", (req, res) => {
+    const { id } = req.params;
+
+    const event = trafficStore.get(id);
+
+    if (!event) {
+      return res.status(404).json({
+        error: "Request not found",
+      });
+    }
+
+    res.json(event);
+  });
 
   /* ---- GITHUB WEBHOOK ---- */
 
