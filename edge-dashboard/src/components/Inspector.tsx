@@ -10,22 +10,12 @@ type InspectData = {
   method: string;
   status: "ok" | "error";
   duration: number;
-
-  // 👇 NEW
-  system?: boolean;
-
-  request?: {
-    headers?: Record<string, string>;
-    query?: Record<string, string>;
-    body?: string;
-  };
-
-  response?: {
-    body?: string;
-  };
-
+  system?: boolean; // ← ADD THIS
+  request?: any;
+  response?: any;
   error?: string | null;
 };
+
 
 export function Inspector({ id }: { id: string }) {
   const [data, setData] = useState<InspectData | null>(null);
