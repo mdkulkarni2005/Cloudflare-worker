@@ -1,192 +1,160 @@
-// server.js
-import { randomUUID, createHmac, timingSafeEqual } from "crypto";
-import { execSync } from "child_process";
+import crypto from "crypto";
+import { spawn } from "child_process";
 
-/* ---------------- CONFIG ---------------- */
+/* ===============================
+   CONFIG
+================================ */
 
 const PORT = 3000;
 const GITHUB_SECRET = process.env.GITHUB_WEBHOOK_SECRET || "dev-secret";
 
-const CORS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "*",
-  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-};
+/* ===============================
+   IN-MEMORY TRAFFIC STORE
+================================ */
 
-/* ---------------- STATE ---------------- */
+const trafficStore = new Map();
 
-const trafficStore = [];
-const sseClients = new Set();
-
-/* ---------------- HELPERS ---------------- */
+/* ===============================
+   HELPERS
+================================ */
 
 function json(data, status = 200) {
-  return new Response(JSON.stringify(data), {
+  return new Response(JSON.stringify(data, null, 2), {
     status,
-    headers: { "Content-Type": "application/json", ...CORS },
+    headers: { "Content-Type": "application/json" },
   });
 }
 
 function text(data, status = 200) {
-  return new Response(data, { status, headers: CORS });
+  return new Response(data, { status });
 }
 
-function broadcast(event) {
-  const payload = `data: ${JSON.stringify(event)}\n\n`;
-  for (const client of sseClients) {
-    try {
-      client.enqueue(payload);
-    } catch {}
-  }
+function timing(start) {
+  return Date.now() - start;
 }
 
-function recordTraffic(entry) {
-  trafficStore.unshift(entry);
-  if (trafficStore.length > 500) trafficStore.pop();
-  broadcast({ type: "traffic", payload: entry });
+function verifyGitHubSignature(req, body) {
+  const sig256 = req.headers.get("x-hub-signature-256");
+  if (!sig256) return false;
+
+  const hmac = crypto.createHmac("sha256", GITHUB_SECRET);
+  const digest = "sha256=" + hmac.update(body).digest("hex");
+
+  return crypto.timingSafeEqual(
+    Buffer.from(sig256),
+    Buffer.from(digest)
+  );
 }
 
-/* ---------------- GITHUB SIGNATURE ---------------- */
-
-function verifyGithubSignature(rawBody, signature) {
-  if (!signature) return false;
-
-  const hmac = createHmac("sha256", GITHUB_SECRET);
-  const digest = `sha256=${hmac.update(rawBody).digest("hex")}`;
-
-  return timingSafeEqual(Buffer.from(digest), Buffer.from(signature));
+function recordTraffic(event) {
+  trafficStore.set(event.id, event);
 }
 
-/* ---------------- SSE ---------------- */
+/* ===============================
+   AUTO DEPLOY
+================================ */
 
-function startInspectorSSE() {
-  const stream = new ReadableStream({
-    start(controller) {
-      sseClients.add(controller);
-      controller.enqueue(`data: ${JSON.stringify({ type: "connected" })}\n\n`);
-      return () => sseClients.delete(controller);
-    },
-  });
+function autoDeploy() {
+  console.log("🚀 Auto deploy triggered");
 
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-      ...CORS,
-    },
+  const git = spawn("git", ["pull"], { stdio: "inherit" });
+
+  git.on("close", (code) => {
+    if (code === 0) {
+      console.log("✅ Code updated successfully");
+      console.log("♻️  Restart server manually for now");
+    } else {
+      console.log("❌ Git pull failed");
+    }
   });
 }
 
-/* ---------------- ROUTER ---------------- */
+/* ===============================
+   MAIN FETCH HANDLER
+================================ */
 
-async function handleRequest(req) {
-  const start = Date.now();
-  const url = new URL(req.url);
-
-  if (req.method === "OPTIONS") {
-    return new Response(null, { status: 204, headers: CORS });
-  }
-
-  /* ---- SYSTEM ROUTES ---- */
-
-  if (url.pathname === "/api/inspect/stream") {
-    return startInspectorSSE();
-  }
-
-  if (url.pathname === "/api/traffic") {
-    return json(trafficStore);
-  }
-
-  // 🔍 INSPECT SINGLE TRAFFIC EVENT
-  app.get("/api/traffic/:id", (req, res) => {
-    const { id } = req.params;
-
-    const event = trafficStore.get(id);
-
-    if (!event) {
-      return res.status(404).json({
-        error: "Request not found",
-      });
-    }
-
-    res.json(event);
-  });
-
-  /* ---- GITHUB WEBHOOK ---- */
-
-  if (url.pathname === "/api/webhooks/github") {
-    const rawBody = await req.text();
-    const event = req.headers.get("x-github-event");
-    const signature = req.headers.get("x-hub-signature-256");
-
-    // Allow ping without signature failure
-    if (event !== "ping") {
-      const valid = verifyGithubSignature(rawBody, signature);
-      if (!valid) {
-        recordTraffic({
-          id: randomUUID(),
-          route: url.pathname,
-          worker: "github",
-          method: req.method,
-          status: "ok", // IMPORTANT
-          system: true,
-          duration: Date.now() - start,
-          response: { note: "Invalid signature ignored" },
-        });
-        return json({ ok: true });
-      }
-    }
-
-    // Auto-deploy on push
-    if (event === "push") {
-      try {
-        execSync("git pull origin main", { stdio: "ignore" });
-      } catch {}
-    }
-
-    recordTraffic({
-      id: randomUUID(),
-      route: url.pathname,
-      worker: "github",
-      method: req.method,
-      status: "ok",
-      system: true,
-      duration: Date.now() - start,
-      response: { event },
-    });
-
-    return json({ ok: true });
-  }
-
-  /* ---- WORKER ROUTES ---- */
-
-  if (url.pathname === "/hi") {
-    const body = await req.text();
-
-    recordTraffic({
-      id: randomUUID(),
-      route: "/hi",
-      worker: "hello",
-      method: req.method,
-      status: "ok",
-      duration: Date.now() - start,
-      request: { body },
-      response: { body },
-    });
-
-    return text(body || "hi");
-  }
-
-  return text("Not Found", 404);
-}
-
-/* ---------------- SERVER ---------------- */
-
-Bun.serve({
+const server = Bun.serve({
   port: PORT,
-  idleTimeout: 0,
-  fetch: handleRequest,
+
+  async fetch(req) {
+    const start = Date.now();
+    const url = new URL(req.url);
+    const id = crypto.randomUUID();
+
+    /* ===============================
+       LIST ALL TRAFFIC
+    ================================ */
+    if (url.pathname === "/api/traffic") {
+      return json(Array.from(trafficStore.values()));
+    }
+
+    /* ===============================
+       INSPECT SINGLE TRAFFIC EVENT
+    ================================ */
+    if (url.pathname.startsWith("/api/traffic/")) {
+      const eventId = url.pathname.split("/").pop();
+      const event = trafficStore.get(eventId);
+
+      if (!event) {
+        return json({ error: "Request not found" }, 404);
+      }
+
+      return json(event);
+    }
+
+    /* ===============================
+       GITHUB WEBHOOK
+    ================================ */
+    if (url.pathname === "/api/webhooks/github" && req.method === "POST") {
+      const body = await req.text();
+
+      const valid = verifyGitHubSignature(req, body);
+
+      const payload = JSON.parse(body);
+
+      const event = {
+        id,
+        time: Date.now(),
+        route: url.pathname,
+        worker: "github",
+        method: "POST",
+        status: valid ? "ok" : "error",
+        duration: timing(start),
+        system: true,
+        request: {
+          headers: Object.fromEntries(req.headers),
+          body,
+        },
+        response: {
+          body: valid ? "Webhook accepted" : "Invalid signature",
+        },
+        error: valid ? null : "Invalid GitHub signature",
+      };
+
+      recordTraffic(event);
+
+      if (!valid) {
+        return json({ error: "Unauthorized" }, 401);
+      }
+
+      console.log("📦 GitHub Webhook received");
+      console.log("Repo:", payload.repository?.full_name);
+      console.log("Branch:", payload.ref);
+
+      autoDeploy();
+
+      return json({ ok: true });
+    }
+
+    /* ===============================
+       FALLBACK
+    ================================ */
+    return text("Not Found", 404);
+  },
 });
+
+/* ===============================
+   BOOT LOG
+================================ */
 
 console.log(`🔥 Mini Edge Runtime running at http://localhost:${PORT}`);
